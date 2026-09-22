@@ -1,9 +1,44 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 
 use crate::core::{FetchContext, ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot};
 
 const USAGE_API_URL: &str = "https://opencode.ai/zen/go/v1/usage";
+
+static LOCAL_AUTH_JSON_DISCOVERY: AtomicBool = AtomicBool::new(false);
+
+/// Lets binaries fall back to the API key stored by the local `opencode` CLI
+/// (`~/.local/share/opencode/auth.json`) without duplicating the secret in
+/// CodexBar settings. Off by default so tests stay hermetic; the desktop app
+/// and the CLI enable it at startup.
+pub fn enable_local_auth_json_discovery() {
+    LOCAL_AUTH_JSON_DISCOVERY.store(true, Ordering::Relaxed);
+}
+
+fn opencode_auth_json_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .or_else(|| dirs::home_dir().map(|home| home.join(".local").join("share")))?;
+    Some(base.join("opencode").join("auth.json"))
+}
+
+fn opencode_auth_json_api_key() -> Option<String> {
+    if !LOCAL_AUTH_JSON_DISCOVERY.load(Ordering::Relaxed) {
+        return None;
+    }
+    let text = std::fs::read_to_string(opencode_auth_json_path()?).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    normalized_api_key(
+        value
+            .get("opencode-go")
+            .and_then(|entry| entry.get("key"))
+            .and_then(serde_json::Value::as_str),
+    )
+}
 
 pub(super) fn normalized_api_key(raw: Option<&str>) -> Option<String> {
     let mut value = raw?.trim();
@@ -17,11 +52,13 @@ pub(super) fn normalized_api_key(raw: Option<&str>) -> Option<String> {
 }
 
 pub(super) fn resolve_api_key(ctx: &FetchContext) -> Option<String> {
-    normalized_api_key(ctx.api_key.as_deref()).or_else(|| {
-        std::env::var("OPENCODE_API_KEY")
-            .ok()
-            .and_then(|value| normalized_api_key(Some(&value)))
-    })
+    normalized_api_key(ctx.api_key.as_deref())
+        .or_else(|| {
+            std::env::var("OPENCODE_API_KEY")
+                .ok()
+                .and_then(|value| normalized_api_key(Some(&value)))
+        })
+        .or_else(opencode_auth_json_api_key)
 }
 
 pub(super) async fn fetch(

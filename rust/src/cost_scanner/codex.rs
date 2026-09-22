@@ -171,7 +171,8 @@ impl CostScanner {
             return dirs.clone();
         }
         let settings = Settings::load();
-        let codex_home = std::env::var("CODEX_HOME").ok();
+        let codex_home =
+            crate::codex_home::env_or_override().map(|path| path.to_string_lossy().into_owned());
         codex_sessions_dir_candidates(
             dirs::home_dir(),
             codex_home,

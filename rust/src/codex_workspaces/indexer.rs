@@ -39,11 +39,10 @@ pub struct CodexLocalDataScope {
 }
 
 impl CodexLocalDataScope {
-    /// `CODEX_HOME` → `CODEX_SQLITE_HOME` → `~/.codex`.
+    /// `CODEX_HOME` → settings codex home → `CODEX_SQLITE_HOME` → `~/.codex`.
     pub fn resolve() -> Option<Self> {
-        let home = non_empty_env("CODEX_HOME")
-            .or_else(|| non_empty_env("CODEX_SQLITE_HOME"))
-            .map(PathBuf::from)
+        let home = crate::codex_home::env_or_override()
+            .or_else(|| non_empty_env("CODEX_SQLITE_HOME").map(PathBuf::from))
             .or_else(|| dirs::home_dir().map(|h| h.join(".codex")))?;
         Some(Self::from_home(home))
     }

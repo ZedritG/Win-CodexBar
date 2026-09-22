@@ -703,10 +703,7 @@ impl LocalAgentSessionScanner {
     }
 
     fn codex_sessions_root() -> PathBuf {
-        if let Ok(path) = std::env::var("CODEX_HOME")
-            && !path.trim().is_empty()
-        {
-            let path = PathBuf::from(path.trim());
+        if let Some(path) = crate::codex_home::env_or_override() {
             if path
                 .file_name()
                 .is_some_and(|name| name.eq_ignore_ascii_case("sessions"))

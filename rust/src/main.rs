@@ -56,6 +56,9 @@ fn run(log_path: &Path) -> i32 {
         return exit_codes::UNEXPECTED_FAILURE;
     }
 
+    codexbar::codex_home::set_from_settings(codexbar::settings::Settings::load().codex_home);
+    codexbar::providers::opencodego::enable_local_auth_json_discovery();
+
     let rt = match Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {

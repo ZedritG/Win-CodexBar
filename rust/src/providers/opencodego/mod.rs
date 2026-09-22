@@ -8,6 +8,8 @@
 pub(crate) mod local;
 mod usage_api;
 
+pub use usage_api::enable_local_auth_json_discovery;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use reqwest::Client;

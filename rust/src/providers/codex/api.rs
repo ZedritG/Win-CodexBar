@@ -59,11 +59,8 @@ impl CodexApi {
         if let Some(override_dir) = &self.codex_home_override {
             return override_dir.clone();
         }
-        if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-            let trimmed = codex_home.trim();
-            if !trimmed.is_empty() {
-                return PathBuf::from(trimmed);
-            }
+        if let Some(codex_home) = crate::codex_home::env_or_override() {
+            return codex_home;
         }
         self.home_dir.join(".codex")
     }

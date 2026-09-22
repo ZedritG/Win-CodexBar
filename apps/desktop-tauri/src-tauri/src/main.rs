@@ -123,6 +123,8 @@ fn main() {
     let is_proof_mode = proof_config.is_some();
     let force_start_visible = std::env::var_os("CODEXBAR_START_VISIBLE").is_some();
     let settings = codexbar::settings::Settings::load();
+    codexbar::codex_home::set_from_settings(settings.codex_home.clone());
+    codexbar::providers::opencodego::enable_local_auth_json_discovery();
     let launch = launch_behavior(
         force_start_visible,
         settings.start_minimized,

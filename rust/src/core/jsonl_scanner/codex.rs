@@ -58,12 +58,9 @@ use helpers::{
 impl JsonlScanner {
     /// Get default Codex sessions root directory
     pub fn default_codex_sessions_root() -> Option<PathBuf> {
-        // Check CODEX_HOME environment variable
-        if let Ok(home) = std::env::var("CODEX_HOME") {
-            let home = home.trim();
-            if !home.is_empty() {
-                return Some(PathBuf::from(home).join("sessions"));
-            }
+        // Check CODEX_HOME environment variable or the settings override
+        if let Some(home) = crate::codex_home::env_or_override() {
+            return Some(home.join("sessions"));
         }
 
         // Default to ~/.codex/sessions

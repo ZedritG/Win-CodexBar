@@ -216,6 +216,13 @@ pub struct Settings {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub codex_custom_sessions_dirs: Vec<String>,
 
+    /// Explicit Codex home used by CodexBar. When set, CodexBar reads this
+    /// directory instead of `~/.codex`; the `CODEX_HOME` environment variable
+    /// keeps priority. Lets CodexBar follow a secondary Codex account without
+    /// touching the default home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+
     /// Discover local and configured SSH Codex/Claude sessions.
     #[serde(default)]
     pub agent_sessions_enabled: bool,
@@ -566,6 +573,7 @@ impl Default for Settings {
             provider_order: Vec::new(), // Empty = canonical ProviderId::all() order
             global_shortcut: default_global_shortcut(), // Ctrl+Shift+U by default
             codex_custom_sessions_dirs: Vec::new(),
+            codex_home: None,
             agent_sessions_enabled: false,
             agent_session_ssh_hosts: Vec::new(),
             hooks_enabled: false,

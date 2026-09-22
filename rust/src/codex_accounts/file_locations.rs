@@ -85,6 +85,7 @@ pub fn auth_backups_directory() -> PathBuf {
 pub fn ambient_codex_home() -> PathBuf {
     AMBIENT_HOME_OVERRIDE
         .with(|cell| cell.borrow().clone())
+        .or_else(crate::codex_home::env_or_override)
         .unwrap_or_else(|| {
             dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))

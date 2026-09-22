@@ -9,6 +9,7 @@ pub mod browser;
 pub mod cli;
 pub mod codex_accounts;
 pub mod codex_cli;
+pub mod codex_home;
 pub mod codex_workspaces;
 pub mod core;
 pub mod cost_scanner;

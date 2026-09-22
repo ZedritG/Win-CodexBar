@@ -120,6 +120,8 @@ pub(super) struct RawSettings {
     #[serde(default = "default_global_shortcut")]
     global_shortcut: String,
     codex_custom_sessions_dirs: Vec<String>,
+    #[serde(default)]
+    codex_home: Option<String>,
     agent_sessions_enabled: bool,
     agent_session_ssh_hosts: Vec<String>,
     #[serde(default)]
@@ -256,6 +258,7 @@ impl Default for RawSettings {
             provider_order: s.provider_order,
             global_shortcut: s.global_shortcut,
             codex_custom_sessions_dirs: s.codex_custom_sessions_dirs,
+            codex_home: s.codex_home,
             agent_sessions_enabled: s.agent_sessions_enabled,
             agent_session_ssh_hosts: s.agent_session_ssh_hosts,
             hooks_enabled: s.hooks_enabled,
@@ -560,6 +563,10 @@ impl From<RawSettings> for Settings {
             },
             global_shortcut: raw.global_shortcut,
             codex_custom_sessions_dirs: raw.codex_custom_sessions_dirs,
+            codex_home: raw
+                .codex_home
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty()),
             agent_sessions_enabled: raw.agent_sessions_enabled,
             agent_session_ssh_hosts: raw.agent_session_ssh_hosts,
             hooks_enabled: raw.hooks_enabled,
