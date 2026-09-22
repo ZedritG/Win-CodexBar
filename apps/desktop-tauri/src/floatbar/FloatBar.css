@@ -182,6 +182,14 @@ body.floatbar-window #root {
   letter-spacing: 0;
   line-height: 1;
 }
+.floatbar__lane {
+  font-size: 0.72em;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.6;
+  line-height: 1;
+}
 .floatbar__reset {
   display: inline-flex;
   align-items: center;

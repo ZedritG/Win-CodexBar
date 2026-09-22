@@ -138,6 +138,7 @@ pub struct SettingsPatch {
     pub dark_text: Option<bool>,
     pub show_reset_inline: Option<bool>,
     pub show_cost: Option<bool>,
+    pub split_windows: Option<bool>,
 }
 
 impl SettingsPatch {
@@ -152,6 +153,7 @@ impl SettingsPatch {
             && self.dark_text.is_none()
             && self.show_reset_inline.is_none()
             && self.show_cost.is_none()
+            && self.split_windows.is_none()
     }
 
     /// Apply this patch to a mutable `Settings`. Values are clamped and
@@ -186,6 +188,9 @@ impl SettingsPatch {
         }
         if let Some(v) = self.show_cost {
             settings.float_bar_show_cost = v;
+        }
+        if let Some(v) = self.split_windows {
+            settings.float_bar_split_windows = v;
         }
     }
 }

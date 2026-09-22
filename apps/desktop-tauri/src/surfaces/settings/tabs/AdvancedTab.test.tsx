@@ -75,6 +75,7 @@ const settings: SettingsSnapshot = {
   floatBarDarkText: false,
   floatBarShowResetInline: false,
   floatBarShowCost: false,
+  floatBarSplitWindows: false,
   claudeDailyRoutinesUsageVisible: true,
   claudeAllowReadingClaudeCodeCredentials: false,
   alibabaTokenPlanRegion: "cn",

@@ -147,6 +147,17 @@ export default function FloatBarSettingsSection({ settings, saving, set }: Props
           />
         </Field>
         <Field
+          label="Show quota windows separately"
+          description="Render one pill per quota window (5h / weekly / monthly) instead of a single selected metric."
+          leading
+        >
+          <Toggle
+            checked={settings.floatBarSplitWindows}
+            disabled={saving || !settings.floatBarEnabled}
+            onChange={(v) => set({ floatBarSplitWindows: v })}
+          />
+        </Field>
+        <Field
           label={t("FloatBarShowResetInline")}
           description={t("FloatBarShowResetInlineHelper")}
           leading

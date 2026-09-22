@@ -24,6 +24,7 @@ import type {
   BootstrapState,
   ProviderLocalUsageSummary,
   ProviderUsageSnapshot,
+  RateWindowSnapshot,
   SettingsSnapshot,
 } from "../types/bridge";
 import { FLOAT_BAR_CONFIG_CHANGED_EVENT, resizeFloatBar } from "./api";
@@ -100,6 +101,48 @@ type FloatBarCostTarget = {
   providerId: string;
   displayName: string;
 };
+
+type FloatBarLane = {
+  key: string;
+  rateWindow: RateWindowSnapshot;
+  label: string | null;
+};
+
+/**
+ * Compact lane label for a quota window. Prefers a duration derived from
+ * `windowMinutes` (5h / 7d / 30d) and falls back to the server-provided
+ * semantic label when the duration is missing.
+ */
+function windowLabel(
+  minutes: number | null | undefined,
+  fallback?: string | null,
+): string | null {
+  if (typeof minutes === "number" && Number.isFinite(minutes) && minutes > 0) {
+    if (minutes % 1440 === 0) return `${Math.round(minutes / 1440)}d`;
+    if (minutes % 60 === 0) return `${Math.round(minutes / 60)}h`;
+    return `${Math.round(minutes)}m`;
+  }
+  return fallback ?? null;
+}
+
+/** Non-informational quota windows of a provider, in primary→tertiary order. */
+function providerLaneWindows(provider: ProviderUsageSnapshot): FloatBarLane[] {
+  const entries: Array<[RateWindowSnapshot | null, string | null | undefined]> = [
+    [provider.primary, provider.primaryLabel],
+    [provider.secondary, provider.secondaryLabel],
+    [provider.tertiary, provider.tertiaryLabel],
+  ];
+  const lanes: FloatBarLane[] = [];
+  entries.forEach(([rateWindow, fallback], index) => {
+    if (!rateWindow || rateWindow.isInformational) return;
+    lanes.push({
+      key: `lane-${index}`,
+      rateWindow,
+      label: windowLabel(rateWindow.windowMinutes, fallback),
+    });
+  });
+  return lanes;
+}
 
 function providerCostKey(provider: ProviderUsageSnapshot): string {
   return `${provider.providerId}:${provider.accountEmail ?? ""}`;
@@ -185,6 +228,8 @@ function CostPill({
  */
 function ProviderPill({
   provider,
+  rateWindow,
+  laneLabel,
   highRemaining,
   critRemaining,
   showAsUsed,
@@ -196,6 +241,8 @@ function ProviderPill({
   stateLabel,
 }: {
   provider: ProviderUsageSnapshot;
+  rateWindow: RateWindowSnapshot;
+  laneLabel: string | null;
   highRemaining: number;
   critRemaining: number;
   showAsUsed: boolean;
@@ -206,7 +253,6 @@ function ProviderPill({
   remainingSuffix: string;
   stateLabel: string;
 }) {
-  const rateWindow = provider.selectedMetric;
   const remaining = Math.max(0, Math.min(100, rateWindow.remainingPercent));
   const used = Math.max(0, Math.min(100, rateWindow.usedPercent));
   const displayPercent = showAsUsed ? used : remaining;
@@ -237,7 +283,7 @@ function ProviderPill({
       title={
         state.isProblem
           ? `${provider.displayName}: ${stateLabel}`
-          : `${provider.displayName}: ${label} ${displaySuffix}${resetSuffix}`
+          : `${provider.displayName}${laneLabel ? ` (${laneLabel})` : ""}: ${label} ${displaySuffix}${resetSuffix}`
       }
       data-tauri-drag-region
       style={{ "--brand": brand } as CSSProperties}
@@ -246,6 +292,11 @@ function ProviderPill({
         <ProviderIcon providerId={provider.providerId} size={iconSize} />
       </span>
       <span className="floatbar__text" data-tauri-drag-region>
+        {laneLabel && (
+          <span className="floatbar__lane" data-tauri-drag-region>
+            {laneLabel}
+          </span>
+        )}
         <span className="floatbar__pct" data-tauri-drag-region>
           {label}
         </span>
@@ -337,6 +388,7 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
   const scale = Math.max(0.75, Math.min(2, settings.floatBarScale / 100));
   const showResetInline = settings.floatBarShowResetInline;
   const showCost = settings.floatBarShowCost;
+  const splitWindows = settings.floatBarSplitWindows;
   const visible = useMemo(() => {
     const enabled = new Set(settings.enabledProviders);
     let list = providers.filter((p) => enabled.has(p.providerId));
@@ -344,11 +396,14 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
       const wanted = new Set(filterIds);
       list = list.filter((p) => wanted.has(p.providerId));
     }
-    return [...list].sort(
-      (a, b) =>
-        b.selectedMetric.usedPercent - a.selectedMetric.usedPercent,
-    );
-  }, [providers, settings.enabledProviders, filterIds]);
+    const sortPercent = (provider: ProviderUsageSnapshot) => {
+      if (!splitWindows) return provider.selectedMetric.usedPercent;
+      const lanes = providerLaneWindows(provider);
+      if (lanes.length <= 1) return provider.selectedMetric.usedPercent;
+      return Math.max(...lanes.map((lane) => lane.rateWindow.usedPercent));
+    };
+    return [...list].sort((a, b) => sortPercent(b) - sortPercent(a));
+  }, [providers, settings.enabledProviders, filterIds, splitWindows]);
 
   const visibleCostTargets = useMemo<FloatBarCostTarget[]>(
     () =>
@@ -449,6 +504,7 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
     style,
     scale,
     showResetInline,
+    splitWindows,
     settings.resetTimeRelative,
   ]);
 
@@ -501,21 +557,30 @@ export default function FloatBar({ state }: { state: BootstrapState }) {
         </div>
       ) : (
         <>
-          {visible.map((p) => (
-            <ProviderPill
-              key={providerCostKey(p)}
-              provider={p}
-              highRemaining={highRemaining}
-              critRemaining={critRemaining}
-              showAsUsed={settings.showAsUsed}
-              scale={scale}
-              showResetInline={showResetInline}
-              resetRelative={settings.resetTimeRelative}
-              usedSuffix={t("PanelUsedSuffix")}
-              remainingSuffix={t("FloatBarRemainingSuffix")}
-              stateLabel={t(describeProviderState(p.errorState).labelKey)}
-            />
-          ))}
+          {visible.flatMap((p) => {
+            const lanes = splitWindows ? providerLaneWindows(p) : [];
+            const targets =
+              lanes.length > 1
+                ? lanes
+                : [{ key: null, rateWindow: p.selectedMetric, label: null }];
+            return targets.map((target, index) => (
+              <ProviderPill
+                key={`${providerCostKey(p)}:${target.key ?? index}`}
+                provider={p}
+                rateWindow={target.rateWindow}
+                laneLabel={target.label}
+                highRemaining={highRemaining}
+                critRemaining={critRemaining}
+                showAsUsed={settings.showAsUsed}
+                scale={scale}
+                showResetInline={showResetInline}
+                resetRelative={settings.resetTimeRelative}
+                usedSuffix={t("PanelUsedSuffix")}
+                remainingSuffix={t("FloatBarRemainingSuffix")}
+                stateLabel={t(describeProviderState(p.errorState).labelKey)}
+              />
+            ));
+          })}
           {visibleCosts.map((summary) => (
             <CostPill
               key={`cost:${summary.key}`}

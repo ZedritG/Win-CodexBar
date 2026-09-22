@@ -75,6 +75,7 @@ pub struct SettingsUpdate {
     pub float_bar_dark_text: Option<bool>,
     pub float_bar_show_reset_inline: Option<bool>,
     pub float_bar_show_cost: Option<bool>,
+    pub float_bar_split_windows: Option<bool>,
     pub promote_tray_icon: Option<bool>,
     pub claude_daily_routines_usage_visible: Option<bool>,
     pub alibaba_token_plan_region: Option<String>,
@@ -408,6 +409,7 @@ impl SettingsUpdate {
             dark_text: self.float_bar_dark_text,
             show_reset_inline: self.float_bar_show_reset_inline,
             show_cost: self.float_bar_show_cost,
+            split_windows: self.float_bar_split_windows,
         }
     }
 
