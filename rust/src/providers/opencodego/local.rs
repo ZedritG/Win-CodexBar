@@ -3,6 +3,11 @@
 //! Mirrors upstream `OpenCodeGoLocalUsageReader`: sums `opencode-go` assistant
 //! message / step-finish costs from the local OpenCode database and maps them
 //! onto session ($12 / 5h), weekly ($30), and monthly ($60) windows.
+//!
+//! OpenCode V2 replaced the legacy `message` / `part` tables with
+//! `session_message` rows whose provider and model live under `model`.
+//! `session_message` also contains the migrated legacy messages, so legacy
+//! rows are only included when their id is absent from that table.
 
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, TimeZone, Timelike, Utc};
 use rusqlite::Connection;
@@ -68,11 +73,141 @@ WHERE hasCost
   )
 "#;
 
+/// OpenCode V2 stores assistant messages in `session_message`; provider and
+/// model are nested under `model`, while cost remains at the message root.
+const SESSION_MESSAGE_USAGE_SQL: &str = r#"
+SELECT
+  CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
+  CAST(json_extract(data, '$.cost') AS REAL) AS cost,
+  1 AS requestCount,
+  COALESCE(json_extract(data, '$.model.id'), json_extract(data, '$.modelID'), '') AS modelID
+FROM session_message
+WHERE type = 'assistant'
+  AND json_valid(data)
+  AND COALESCE(
+    json_extract(data, '$.model.providerID'),
+    json_extract(data, '$.providerID')
+  ) = 'opencode-go'
+  AND json_type(data, '$.cost') IN ('integer', 'real')
+"#;
+
+/// V2 plus legacy rows that have not been migrated into `session_message`.
+/// Used when the legacy `message` table exists but `part` does not.
+const SESSION_MESSAGE_AND_LEGACY_MESSAGE_USAGE_SQL: &str = r#"
+WITH session_usage AS (
+  SELECT
+    CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
+    CAST(json_extract(data, '$.cost') AS REAL) AS cost,
+    1 AS requestCount,
+    COALESCE(json_extract(data, '$.model.id'), json_extract(data, '$.modelID'), '') AS modelID
+  FROM session_message
+  WHERE type = 'assistant'
+    AND json_valid(data)
+    AND COALESCE(
+      json_extract(data, '$.model.providerID'),
+      json_extract(data, '$.providerID')
+    ) = 'opencode-go'
+    AND json_type(data, '$.cost') IN ('integer', 'real')
+),
+legacy_messages AS (
+  SELECT
+    id AS messageID,
+    CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
+    CAST(json_extract(data, '$.cost') AS REAL) AS cost,
+    json_type(data, '$.cost') IN ('integer', 'real') AS hasCost,
+    COALESCE(json_extract(data, '$.modelID'), '') AS modelID
+  FROM message
+  WHERE json_valid(data)
+    AND json_extract(data, '$.providerID') = 'opencode-go'
+    AND json_extract(data, '$.role') = 'assistant'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM session_message s
+      WHERE s.id = message.id
+    )
+)
+SELECT createdMs, cost, requestCount, modelID
+FROM session_usage
+UNION ALL
+SELECT createdMs, cost, 1 AS requestCount, modelID
+FROM legacy_messages
+WHERE hasCost
+"#;
+
+/// V2 plus legacy rows that have not been migrated into `session_message`.
+/// Prefers per-step `part` costs for legacy messages, matching the legacy
+/// reader, and falls back to the message-level cost when no step exists.
+const SESSION_MESSAGE_AND_LEGACY_PART_USAGE_SQL: &str = r#"
+WITH session_usage AS (
+  SELECT
+    CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
+    CAST(json_extract(data, '$.cost') AS REAL) AS cost,
+    1 AS requestCount,
+    COALESCE(json_extract(data, '$.model.id'), json_extract(data, '$.modelID'), '') AS modelID
+  FROM session_message
+  WHERE type = 'assistant'
+    AND json_valid(data)
+    AND COALESCE(
+      json_extract(data, '$.model.providerID'),
+      json_extract(data, '$.providerID')
+    ) = 'opencode-go'
+    AND json_type(data, '$.cost') IN ('integer', 'real')
+),
+legacy_messages AS (
+  SELECT
+    id AS messageID,
+    CAST(COALESCE(json_extract(data, '$.time.created'), time_created) AS INTEGER) AS createdMs,
+    CAST(json_extract(data, '$.cost') AS REAL) AS cost,
+    json_type(data, '$.cost') IN ('integer', 'real') AS hasCost,
+    COALESCE(json_extract(data, '$.modelID'), '') AS modelID
+  FROM message
+  WHERE json_valid(data)
+    AND json_extract(data, '$.providerID') = 'opencode-go'
+    AND json_extract(data, '$.role') = 'assistant'
+    AND NOT EXISTS (
+      SELECT 1
+      FROM session_message s
+      WHERE s.id = message.id
+    )
+),
+legacy_usage AS (
+  SELECT
+    CAST(COALESCE(json_extract(p.data, '$.time.created'), p.time_created, m.createdMs) AS INTEGER)
+      AS createdMs,
+    CAST(json_extract(p.data, '$.cost') AS REAL) AS cost,
+    1 AS requestCount,
+    m.modelID AS modelID
+  FROM part p
+  JOIN legacy_messages m ON m.messageID = p.message_id
+  WHERE json_valid(p.data)
+    AND json_extract(p.data, '$.type') = 'step-finish'
+    AND json_type(p.data, '$.cost') IN ('integer', 'real')
+  UNION ALL
+  SELECT createdMs, cost, 1 AS requestCount, modelID
+  FROM legacy_messages m
+  WHERE hasCost
+    AND NOT EXISTS (
+      SELECT 1
+      FROM part p
+      WHERE p.message_id = m.messageID
+        AND json_valid(p.data)
+        AND json_extract(p.data, '$.type') = 'step-finish'
+        AND json_type(p.data, '$.cost') IN ('integer', 'real')
+    )
+)
+SELECT createdMs, cost, requestCount, modelID
+FROM session_usage
+UNION ALL
+SELECT createdMs, cost, requestCount, modelID
+FROM legacy_usage
+"#;
+
 #[derive(Debug, Clone)]
 pub(crate) struct UsageRow {
     created_ms: i64,
     cost: f64,
-    /// One provider invocation per step-finish part; message-only databases fall back to one.
+    /// One provider invocation per legacy step-finish part or V2 assistant
+    /// message; legacy message-only databases fall back to one.
     request_count: u32,
     /// The underlying model behind the `opencode-go` Zen proxy; empty when unattributed.
     model: String,
@@ -216,10 +351,21 @@ fn read_rows(db_path: &Path) -> Result<Vec<UsageRow>, ProviderError> {
             ProviderError::Other(format!("SQLite error reading OpenCode Go usage: {e}"))
         })?;
 
-    let sql = if has_table(&conn, "part") {
-        MESSAGE_AND_PART_USAGE_SQL
-    } else {
-        MESSAGE_USAGE_SQL
+    let sql = match (
+        has_table(&conn, "session_message"),
+        has_table(&conn, "message"),
+        has_table(&conn, "part"),
+    ) {
+        (true, true, true) => SESSION_MESSAGE_AND_LEGACY_PART_USAGE_SQL,
+        (true, true, false) => SESSION_MESSAGE_AND_LEGACY_MESSAGE_USAGE_SQL,
+        (true, false, _) => SESSION_MESSAGE_USAGE_SQL,
+        (false, true, true) => MESSAGE_AND_PART_USAGE_SQL,
+        (false, true, false) => MESSAGE_USAGE_SQL,
+        (false, false, _) => {
+            return Err(ProviderError::Other(
+                "OpenCode Go local usage history is unavailable: no message tables".into(),
+            ));
+        }
     };
 
     let mut stmt = conn.prepare(sql).map_err(|e| {
@@ -730,6 +876,57 @@ mod tests {
         .unwrap();
     }
 
+    /// Create the OpenCode V2 `session_message` table shape used by the reader.
+    fn create_session_message_table(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE session_message (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                time_created INTEGER NOT NULL,
+                time_updated INTEGER NOT NULL,
+                data TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+    }
+
+    /// Insert one V2 assistant message. `cost` is omitted when `None`, matching
+    /// in-flight messages that OpenCode has not finalized yet.
+    fn insert_session_message(
+        conn: &Connection,
+        id: &str,
+        created_ms: i64,
+        cost: Option<f64>,
+        model: Option<&str>,
+    ) {
+        let cost_json = match cost {
+            Some(c) => format!(r#","cost":{c}"#),
+            None => String::new(),
+        };
+        let model_id = model.unwrap_or("");
+        let data = format!(
+            r#"{{"time":{{"created":{created_ms}}},"model":{{"id":"{model_id}","providerID":"opencode-go"}}{cost_json}}}"#
+        );
+        conn.execute(
+            "INSERT INTO session_message
+                (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?1, 'ses_test', 'assistant', 0, ?2, ?2, ?3)",
+            rusqlite::params![id, created_ms, data],
+        )
+        .unwrap();
+    }
+
+    fn write_session_message_db(path: &Path, rows: &[(i64, f64, &str)]) {
+        let conn = Connection::open(path).unwrap();
+        create_session_message_table(&conn);
+        for (i, (created_ms, cost, model)) in rows.iter().enumerate() {
+            let id = format!("m{i}");
+            insert_session_message(&conn, &id, *created_ms, Some(*cost), Some(model));
+        }
+    }
+
     fn iso_ms(iso: &str) -> i64 {
         chrono::DateTime::parse_from_rfc3339(iso)
             .unwrap()
@@ -790,6 +987,97 @@ mod tests {
         // Best-effort teardown; leftover temp files are harmless.
         let _removed_db = std::fs::remove_file(&db);
         let _removed_auth = std::fs::remove_file(&auth);
+    }
+
+    #[test]
+    fn reads_v2_session_message_usage() {
+        let db = temp_db_path("v2");
+        let now = Utc.with_ymd_and_hms(2026, 3, 18, 12, 0, 0).unwrap();
+        let now_ms = now.timestamp_millis();
+        let month_anchor_ms = now_ms - 10 * 24 * 60 * 60 * 1000;
+        write_session_message_db(
+            &db,
+            &[
+                (now_ms - 60_000, 6.0, "deepseek-v4.1-flash"),
+                (
+                    start_of_utc_iso_week_ms(now) + 3_600_000,
+                    9.0,
+                    "claude-haiku-5-5",
+                ),
+                (month_anchor_ms, 15.0, "gpt-5"),
+            ],
+        );
+
+        let auth = db.with_extension("auth.json");
+        let _written = std::fs::write(&auth, r#"{"opencode-go":{"key":"test-key"}}"#);
+
+        let snap = fetch_from_paths(&auth, &db, now).unwrap();
+        assert!((snap.rolling_usage_percent - 50.0).abs() < 0.05, "{snap:?}");
+        assert!((snap.weekly_usage_percent - 50.0).abs() < 0.05, "{snap:?}");
+        assert!((snap.monthly_usage_percent - 50.0).abs() < 0.05, "{snap:?}");
+
+        let rows = read_rows(&db).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert!(
+            rows.iter().any(|row| row.model == "deepseek-v4.1-flash"),
+            "{rows:?}"
+        );
+        let total: f64 = rows.iter().map(|row| row.cost).sum();
+        assert!((total - 30.0).abs() < 1e-6, "{rows:?}");
+
+        let _removed_db = std::fs::remove_file(&db);
+        let _removed_auth = std::fs::remove_file(&auth);
+    }
+
+    #[test]
+    fn v2_rows_supersede_migrated_legacy_rows_without_double_counting() {
+        let db = temp_db_path("v2-dedup");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER);",
+        )
+        .unwrap();
+        create_session_message_table(&conn);
+
+        let created = iso_ms("2026-03-06T11:00:00.000Z");
+        // m1 was migrated to V2: its legacy message/part cost must not be added
+        // again. m2 exists only in the legacy table and must still be counted.
+        insert_message(&conn, "m1", created, Some(6.0), Some("deepseek-v4.1-flash"));
+        insert_step_finish_part(&conn, "p1", "m1", created, 6.0);
+        insert_message(&conn, "m2", created, Some(3.0), Some("gpt-5"));
+        insert_session_message(&conn, "m1", created, Some(6.0), Some("deepseek-v4.1-flash"));
+        drop(conn);
+
+        let rows = read_rows(&db).unwrap();
+        let total: f64 = rows.iter().map(|row| row.cost).sum();
+        assert!((total - 9.0).abs() < 1e-6, "{rows:?}");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+
+        let _removed_db = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn empty_v2_table_falls_back_to_legacy_usage() {
+        let db = temp_db_path("v2-empty");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE message (id TEXT PRIMARY KEY, data TEXT, time_created INTEGER);
+             CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT, data TEXT, time_created INTEGER);",
+        )
+        .unwrap();
+        create_session_message_table(&conn);
+
+        let created = iso_ms("2026-03-06T11:00:00.000Z");
+        insert_message(&conn, "m1", created, Some(3.0), Some("deepseek-v4.1-flash"));
+        insert_step_finish_part(&conn, "p1", "m1", created, 3.0);
+        drop(conn);
+
+        let rows = read_rows(&db).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].cost - 3.0).abs() < 1e-6, "{rows:?}");
+
+        let _removed_db = std::fs::remove_file(&db);
     }
 
     #[test]
