@@ -1,19 +1,23 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use reqwest::Client;
 
-use crate::core::{FetchContext, ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot};
+use crate::core::{
+    FetchContext, ProviderError, ProviderFetchResult, RateWindow, UsageSnapshot,
+    open_readonly_sqlite_connection,
+};
 
 const USAGE_API_URL: &str = "https://opencode.ai/zen/go/v1/usage";
 
 static LOCAL_AUTH_JSON_DISCOVERY: AtomicBool = AtomicBool::new(false);
 
-/// Lets binaries fall back to the API key stored by the local `opencode` CLI
-/// (`~/.local/share/opencode/auth.json`) without duplicating the secret in
-/// CodexBar settings. Off by default so tests stay hermetic; the desktop app
-/// and the CLI enable it at startup.
+/// Lets binaries use credentials stored by the local `opencode` CLI
+/// (`~/.local/share/opencode/auth.json` and the V2 OAuth row in `opencode.db`)
+/// without duplicating the secret in CodexBar settings. Off by default so tests
+/// stay hermetic; the desktop app and the CLI enable it at startup.
 pub fn enable_local_auth_json_discovery() {
     LOCAL_AUTH_JSON_DISCOVERY.store(true, Ordering::Relaxed);
 }
@@ -40,6 +44,61 @@ fn opencode_auth_json_api_key() -> Option<String> {
     )
 }
 
+/// OpenCode V2 authenticates the console/CLI with an OAuth credential stored
+/// in `opencode.db` (`credential.value`). Its `access` token works against the
+/// public Go usage endpoint, while the legacy `auth.json` API key may be
+/// revoked after a plan renewal. Read only active OAuth rows.
+fn opencode_v2_oauth_access_token(now: DateTime<Utc>) -> Option<String> {
+    if !LOCAL_AUTH_JSON_DISCOVERY.load(Ordering::Relaxed) {
+        return None;
+    }
+    for (_, db) in super::local::candidate_paths() {
+        if let Some(token) = oauth_access_token_from_db(&db, now) {
+            return Some(token);
+        }
+    }
+    None
+}
+
+fn oauth_access_token_from_db(db_path: &Path, now: DateTime<Utc>) -> Option<String> {
+    if !db_path.is_file() {
+        return None;
+    }
+    let conn = open_readonly_sqlite_connection(db_path, Duration::from_millis(250)).ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT value
+             FROM credential
+             WHERE integration_id IN ('opencode', 'opencode-go')
+               AND active = 1
+             ORDER BY time_updated DESC",
+        )
+        .ok()?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
+    rows.flatten()
+        .find_map(|value| parse_oauth_access_token(&value, now))
+}
+
+fn parse_oauth_access_token(value: &str, now: DateTime<Utc>) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
+    if parsed.get("type").and_then(serde_json::Value::as_str) != Some("oauth") {
+        return None;
+    }
+    let access = parsed
+        .get("access")
+        .and_then(serde_json::Value::as_str)?
+        .trim();
+    if access.is_empty() {
+        return None;
+    }
+    if let Some(expires) = parsed.get("expires").and_then(serde_json::Value::as_i64)
+        && expires <= now.timestamp_millis() + 60_000
+    {
+        return None;
+    }
+    Some(access.to_string())
+}
+
 pub(super) fn normalized_api_key(raw: Option<&str>) -> Option<String> {
     let mut value = raw?.trim();
     if value.len() >= 2
@@ -51,14 +110,29 @@ pub(super) fn normalized_api_key(raw: Option<&str>) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-pub(super) fn resolve_api_key(ctx: &FetchContext) -> Option<String> {
-    normalized_api_key(ctx.api_key.as_deref())
-        .or_else(|| {
-            std::env::var("OPENCODE_API_KEY")
-                .ok()
-                .and_then(|value| normalized_api_key(Some(&value)))
-        })
-        .or_else(opencode_auth_json_api_key)
+fn push_unique(keys: &mut Vec<String>, key: Option<String>) {
+    if let Some(key) = key
+        && !keys.iter().any(|existing| existing == &key)
+    {
+        keys.push(key);
+    }
+}
+
+/// Credential candidates in priority order. Explicit settings/environment
+/// values win; the V2 OAuth token is tried before the legacy `auth.json` key
+/// so a revoked key does not mask a valid console login.
+pub(super) fn resolve_api_keys(ctx: &FetchContext) -> Vec<String> {
+    let mut keys = Vec::new();
+    push_unique(&mut keys, normalized_api_key(ctx.api_key.as_deref()));
+    push_unique(
+        &mut keys,
+        std::env::var("OPENCODE_API_KEY")
+            .ok()
+            .and_then(|value| normalized_api_key(Some(&value))),
+    );
+    push_unique(&mut keys, opencode_v2_oauth_access_token(Utc::now()));
+    push_unique(&mut keys, opencode_auth_json_api_key());
+    keys
 }
 
 pub(super) async fn fetch(
@@ -96,6 +170,29 @@ pub(super) async fn fetch(
     }
     let usage = parse_usage_text(&body, Utc::now())?;
     Ok(ProviderFetchResult::new(usage, source_label))
+}
+
+/// Try every discovered credential until one is accepted. This keeps a stale
+/// API key in settings or `auth.json` from hiding a valid V2 OAuth login.
+pub(super) async fn fetch_with_fallback(
+    client: &Client,
+    ctx: &FetchContext,
+    source_label: &str,
+) -> Result<ProviderFetchResult, ProviderError> {
+    let keys = resolve_api_keys(ctx);
+    if keys.is_empty() {
+        return Err(ProviderError::NotInstalled(
+            "Missing OpenCode Go API key. Add one in Settings or set OPENCODE_API_KEY.".to_string(),
+        ));
+    }
+    let mut last_error = None;
+    for key in keys {
+        match fetch(client, ctx, &key, source_label).await {
+            Ok(result) => return Ok(result),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or(ProviderError::AuthRequired))
 }
 
 fn parse_usage_text(text: &str, now: DateTime<Utc>) -> Result<UsageSnapshot, ProviderError> {
@@ -183,6 +280,92 @@ fn api_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_credential_db(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("opencodego-usage-api-{label}-{nanos}.db"))
+    }
+
+    fn write_credential_db(path: &Path, rows: &[(i64, &str, &str, i64)]) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE credential (
+                id TEXT PRIMARY KEY,
+                integration_id TEXT NOT NULL,
+                value TEXT NOT NULL,
+                active INTEGER,
+                time_updated INTEGER NOT NULL
+            );",
+        )
+        .unwrap();
+        for (index, (active, integration_id, value, time_updated)) in rows.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO credential
+                    (id, integration_id, value, active, time_updated)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    format!("cred{index}"),
+                    integration_id,
+                    value,
+                    active,
+                    time_updated
+                ],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn discovers_active_v2_oauth_token_and_skips_expired_rows() {
+        let now = DateTime::parse_from_rfc3339("2026-10-19T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let db = temp_credential_db("oauth");
+        let expired = format!(
+            r#"{{"type":"oauth","access":"st_expired","expires":{}}}"#,
+            now.timestamp_millis() - 1
+        );
+        let valid = format!(
+            r#"{{"type":"oauth","access":"st_valid","expires":{}}}"#,
+            now.timestamp_millis() + 3_600_000
+        );
+        write_credential_db(
+            &db,
+            &[
+                (1, "opencode", expired.as_str(), 3),
+                (1, "opencode", valid.as_str(), 2),
+                (0, "opencode", valid.as_str(), 1),
+            ],
+        );
+
+        assert_eq!(
+            oauth_access_token_from_db(&db, now).as_deref(),
+            Some("st_valid")
+        );
+
+        let _removed = std::fs::remove_file(&db);
+    }
+
+    #[test]
+    fn ignores_non_oauth_credentials_in_the_credential_table() {
+        let now = DateTime::parse_from_rfc3339("2026-10-19T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let db = temp_credential_db("api-key");
+        write_credential_db(
+            &db,
+            &[(1, "opencode-go", r#"{"type":"key","key":"sk_stale"}"#, 1)],
+        );
+
+        assert_eq!(oauth_access_token_from_db(&db, now), None);
+
+        let _removed = std::fs::remove_file(&db);
+    }
 
     #[test]
     fn api_key_normalization_matches_upstream_settings_reader() {

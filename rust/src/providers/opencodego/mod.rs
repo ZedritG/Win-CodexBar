@@ -591,27 +591,17 @@ impl Provider for OpenCodeGoProvider {
                         tracing::debug!("OpenCode Go local failed in Auto; trying API/web: {e}");
                     }
                 }
-                if let Some(api_key) = usage_api::resolve_api_key(ctx) {
-                    match usage_api::fetch(&self.client, ctx, &api_key, "api").await {
-                        Ok(result) => return Ok(result),
-                        Err(e) => {
-                            tracing::debug!("OpenCode Go API failed in Auto; trying web: {e}")
-                        }
+                match usage_api::fetch_with_fallback(&self.client, ctx, "api").await {
+                    Ok(result) => return Ok(result),
+                    Err(e) => {
+                        tracing::debug!("OpenCode Go API failed in Auto; trying web: {e}")
                     }
                 }
                 self.fetch_web(ctx).await
             }
             SourceMode::Web => self.fetch_web(ctx).await,
             SourceMode::Cli => self.fetch_local_with_balance(ctx).await,
-            SourceMode::OAuth => {
-                let api_key = usage_api::resolve_api_key(ctx).ok_or_else(|| {
-                    ProviderError::NotInstalled(
-                        "Missing OpenCode Go API key. Add one in Settings or set OPENCODE_API_KEY."
-                            .to_string(),
-                    )
-                })?;
-                usage_api::fetch(&self.client, ctx, &api_key, "api").await
-            }
+            SourceMode::OAuth => usage_api::fetch_with_fallback(&self.client, ctx, "api").await,
         }
     }
 
@@ -673,8 +663,7 @@ impl OpenCodeGoProvider {
     ) -> Result<ProviderFetchResult, ProviderError> {
         let snap = local::fetch_local_usage(Utc::now())?;
         let mut result = snap.to_fetch_result();
-        if let Some(api_key) = usage_api::resolve_api_key(ctx)
-            && let Ok(api_result) = usage_api::fetch(&self.client, ctx, &api_key, "local+api").await
+        if let Ok(api_result) = usage_api::fetch_with_fallback(&self.client, ctx, "local+api").await
         {
             result = api_result;
         }
